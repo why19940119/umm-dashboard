@@ -1,0 +1,12 @@
+name = "umm-dashboard"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+[assets]
+directory = "."
+binding = "ASSETS"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "umm-snapshots"
+database_id = "d603386f-1f27-4220-893d-31186afb8b81"
