@@ -1,22 +1,43 @@
 const COOLDOWN_SECONDS = 30;
 
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-UMM-Publish-Secret",
+  };
+}
+
+function jsonResponse(body, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      ...corsHeaders(),
+      ...extraHeaders,
+    },
+  });
+}
+
+function publishSecretFromRequest(request) {
+  const header = request.headers.get("X-UMM-Publish-Secret");
+  if (header) return header.trim();
+  const auth = request.headers.get("Authorization");
+  if (auth && auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7).trim();
+  }
+  return null;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // CORS preflight 支援
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        },
-      });
+      return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
-    // 1. GET /api/snapshot (Dashboard 讀取最新快照)
+    // 1. GET /api/snapshot
     if (url.pathname === "/api/snapshot" && request.method === "GET") {
       try {
         const row = await env.DB.prepare(
@@ -24,47 +45,50 @@ export default {
         ).first();
 
         if (!row || !row.payload_json) {
-          return new Response(JSON.stringify({
+          return jsonResponse({
             status: "NO_DATA",
             message: "No snapshot available in D1 database yet."
-          }), {
-            status: 404,
-            headers: {
-              "Content-Type": "application/json; charset=utf-8",
-              "Access-Control-Allow-Origin": "*",
-            }
-          });
+          }, 404);
         }
 
         return new Response(row.payload_json, {
           status: 200,
           headers: {
             "Content-Type": "application/json; charset=utf-8",
-            "Access-Control-Allow-Origin": "*",
             "Cache-Control": "no-store",
+            ...corsHeaders(),
           }
         });
       } catch (err) {
-        return new Response(JSON.stringify({
-          status: "DB_ERROR",
-          message: err.message
-        }), {
-          status: 500,
-          headers: {
-            "Content-Type": "application/json; charset=utf-8",
-            "Access-Control-Allow-Origin": "*",
-          }
-        });
+        return jsonResponse({ status: "DB_ERROR", message: err.message }, 500);
       }
     }
 
-    // 2. POST /api/snapshot (接收來自 Apps Script 的最新快照並存入 D1)
+    // 2. POST /api/snapshot — Apps Script publisher → D1
     if (url.pathname === "/api/snapshot" && request.method === "POST") {
       try {
+        // When Worker has UMM_REFRESH_SECRET, require matching publish secret (header).
+        // Avoids open write while staying compatible if secret env is temporarily unset.
+        if (env.UMM_REFRESH_SECRET) {
+          const provided = publishSecretFromRequest(request);
+          if (!provided || provided !== env.UMM_REFRESH_SECRET) {
+            return jsonResponse({ status: "UNAUTHORIZED", message: "Invalid or missing publish secret." }, 401);
+          }
+        }
+
         const payload = await request.json();
-        const snapshotId = payload.latestSnapshot?.snapshotId || `SNAP_${Date.now()}`;
+        // Prefer publishId so each dashboard refresh gets a distinct D1 row even when
+        // latestSnapshot.snapshotId is reused from Daily_Snapshot.
+        const snapshotId =
+          payload.publishId ||
+          payload.latestSnapshot?.snapshotId ||
+          `SNAP_${Date.now()}`;
         const generatedAtHkt = payload.generatedAtHkt || new Date().toISOString();
-        const marketDateEt = payload.marketDateEt || payload.aiReport?.marketDateEt || null;
+        const marketDateEt =
+          payload.marketDateEt ||
+          payload.latestSnapshot?.marketDateEt ||
+          payload.aiReport?.marketDateEt ||
+          null;
         const payloadJson = JSON.stringify(payload);
 
         await env.DB.prepare(`
@@ -76,34 +100,19 @@ export default {
             payload_json = excluded.payload_json
         `).bind(snapshotId, generatedAtHkt, marketDateEt, payloadJson).run();
 
-        return new Response(JSON.stringify({ ok: true, status: "STORED", snapshotId }), {
-          status: 200,
-          headers: {
-            "Content-Type": "application/json; charset=utf-8",
-            "Access-Control-Allow-Origin": "*",
-          }
-        });
+        return jsonResponse({ ok: true, status: "STORED", snapshotId, generatedAtHkt });
       } catch (err) {
-        return new Response(JSON.stringify({ status: "WRITE_ERROR", message: err.message }), {
-          status: 500,
-          headers: {
-            "Content-Type": "application/json; charset=utf-8",
-            "Access-Control-Allow-Origin": "*",
-          }
-        });
+        return jsonResponse({ status: "WRITE_ERROR", message: err.message }, 500);
       }
     }
 
-    // 3. POST /api/refresh (觸發 Apps Script 刷新)
+    // 3. POST /api/refresh
     if (url.pathname === "/api/refresh" && request.method === "POST") {
       if (!env.UMM_REFRESH_URL || !env.UMM_REFRESH_SECRET) {
-        return new Response(JSON.stringify({
+        return jsonResponse({
           status: "SERVER_MISCONFIGURED",
           message: "UMM_REFRESH_URL or UMM_REFRESH_SECRET missing in Cloudflare environment."
-        }), {
-          status: 500,
-          headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" }
-        });
+        }, 500);
       }
 
       try {
@@ -114,19 +123,12 @@ export default {
         });
 
         const upstreamData = await upstream.json();
-        return new Response(JSON.stringify(upstreamData), {
-          status: upstream.ok ? 200 : 502,
-          headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" }
-        });
+        return jsonResponse(upstreamData, upstream.ok ? 200 : 502);
       } catch (err) {
-        return new Response(JSON.stringify({ status: "REFRESH_FAILED", message: err.message }), {
-          status: 502,
-          headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" }
-        });
+        return jsonResponse({ status: "REFRESH_FAILED", message: err.message }, 502);
       }
     }
 
-    // 4. 託管的前端靜態檔案
     if (env.ASSETS) {
       return env.ASSETS.fetch(request);
     }
