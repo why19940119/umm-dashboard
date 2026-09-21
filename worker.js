@@ -1,20 +1,31 @@
 const COOLDOWN_SECONDS = 30;
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
+/** CORS for reads: open. Mutating routes: same-origin only (Apps Script has no Origin). */
+function corsHeaders(request, { mutate = false } = {}) {
+  const headers = {
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-UMM-Publish-Secret",
   };
+  if (mutate) {
+    const origin = request.headers.get("Origin");
+    const self = new URL(request.url).origin;
+    if (origin && origin === self) {
+      headers["Access-Control-Allow-Origin"] = origin;
+      headers["Vary"] = "Origin";
+    }
+    // No Origin (UrlFetchApp / curl) → omit ACAO; browser cross-origin cannot use custom auth header.
+  } else {
+    headers["Access-Control-Allow-Origin"] = "*";
+  }
+  return headers;
 }
 
-function jsonResponse(body, status = 200, extraHeaders = {}) {
+function jsonResponse(request, body, status = 200, { mutate = false } = {}) {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      ...corsHeaders(),
-      ...extraHeaders,
+      ...corsHeaders(request, { mutate }),
     },
   });
 }
@@ -29,12 +40,52 @@ function publishSecretFromRequest(request) {
   return null;
 }
 
+/**
+ * Fail-closed: missing Worker secret OR mismatch → refuse write/mutate.
+ * Never accept unauthenticated POSTs when secret env is unset.
+ */
+function requirePublishSecret(request, env) {
+  const expected = env.UMM_REFRESH_SECRET;
+  if (!expected || !String(expected).trim()) {
+    return {
+      ok: false,
+      response: jsonResponse(
+        request,
+        {
+          status: "SERVER_MISCONFIGURED",
+          message: "UMM_REFRESH_SECRET is not set on the Worker; refusing unauthenticated writes.",
+        },
+        503,
+        { mutate: true }
+      ),
+    };
+  }
+  const provided = publishSecretFromRequest(request);
+  if (!provided || provided !== expected) {
+    return {
+      ok: false,
+      response: jsonResponse(
+        request,
+        { status: "UNAUTHORIZED", message: "Invalid or missing publish secret." },
+        401,
+        { mutate: true }
+      ),
+    };
+  }
+  return { ok: true };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
+      const mutate =
+        url.pathname === "/api/snapshot" || url.pathname === "/api/refresh";
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(request, { mutate }),
+      });
     }
 
     // 1. GET /api/snapshot
@@ -45,9 +96,9 @@ export default {
         ).first();
 
         if (!row || !row.payload_json) {
-          return jsonResponse({
+          return jsonResponse(request, {
             status: "NO_DATA",
-            message: "No snapshot available in D1 database yet."
+            message: "No snapshot available in D1 database yet.",
           }, 404);
         }
 
@@ -56,29 +107,21 @@ export default {
           headers: {
             "Content-Type": "application/json; charset=utf-8",
             "Cache-Control": "no-store",
-            ...corsHeaders(),
-          }
+            ...corsHeaders(request, { mutate: false }),
+          },
         });
       } catch (err) {
-        return jsonResponse({ status: "DB_ERROR", message: err.message }, 500);
+        return jsonResponse(request, { status: "DB_ERROR", message: err.message }, 500);
       }
     }
 
-    // 2. POST /api/snapshot — Apps Script publisher → D1
+    // 2. POST /api/snapshot — Apps Script publisher → D1 (auth required, fail-closed)
     if (url.pathname === "/api/snapshot" && request.method === "POST") {
-      try {
-        // When Worker has UMM_REFRESH_SECRET, require matching publish secret (header).
-        // Avoids open write while staying compatible if secret env is temporarily unset.
-        if (env.UMM_REFRESH_SECRET) {
-          const provided = publishSecretFromRequest(request);
-          if (!provided || provided !== env.UMM_REFRESH_SECRET) {
-            return jsonResponse({ status: "UNAUTHORIZED", message: "Invalid or missing publish secret." }, 401);
-          }
-        }
+      const gate = requirePublishSecret(request, env);
+      if (!gate.ok) return gate.response;
 
+      try {
         const payload = await request.json();
-        // Prefer publishId so each dashboard refresh gets a distinct D1 row even when
-        // latestSnapshot.snapshotId is reused from Daily_Snapshot.
         const snapshotId =
           payload.publishId ||
           payload.latestSnapshot?.snapshotId ||
@@ -100,19 +143,37 @@ export default {
             payload_json = excluded.payload_json
         `).bind(snapshotId, generatedAtHkt, marketDateEt, payloadJson).run();
 
-        return jsonResponse({ ok: true, status: "STORED", snapshotId, generatedAtHkt });
+        return jsonResponse(
+          request,
+          { ok: true, status: "STORED", snapshotId, generatedAtHkt },
+          200,
+          { mutate: true }
+        );
       } catch (err) {
-        return jsonResponse({ status: "WRITE_ERROR", message: err.message }, 500);
+        return jsonResponse(
+          request,
+          { status: "WRITE_ERROR", message: err.message },
+          500,
+          { mutate: true }
+        );
       }
     }
 
-    // 3. POST /api/refresh
+    // 3. POST /api/refresh — requires same secret; then proxy to Apps Script
     if (url.pathname === "/api/refresh" && request.method === "POST") {
-      if (!env.UMM_REFRESH_URL || !env.UMM_REFRESH_SECRET) {
-        return jsonResponse({
-          status: "SERVER_MISCONFIGURED",
-          message: "UMM_REFRESH_URL or UMM_REFRESH_SECRET missing in Cloudflare environment."
-        }, 500);
+      const gate = requirePublishSecret(request, env);
+      if (!gate.ok) return gate.response;
+
+      if (!env.UMM_REFRESH_URL) {
+        return jsonResponse(
+          request,
+          {
+            status: "SERVER_MISCONFIGURED",
+            message: "UMM_REFRESH_URL missing in Cloudflare environment.",
+          },
+          503,
+          { mutate: true }
+        );
       }
 
       try {
@@ -123,9 +184,16 @@ export default {
         });
 
         const upstreamData = await upstream.json();
-        return jsonResponse(upstreamData, upstream.ok ? 200 : 502);
+        return jsonResponse(request, upstreamData, upstream.ok ? 200 : 502, {
+          mutate: true,
+        });
       } catch (err) {
-        return jsonResponse({ status: "REFRESH_FAILED", message: err.message }, 502);
+        return jsonResponse(
+          request,
+          { status: "REFRESH_FAILED", message: err.message },
+          502,
+          { mutate: true }
+        );
       }
     }
 
@@ -134,5 +202,5 @@ export default {
     }
 
     return new Response("Not Found", { status: 404 });
-  }
+  },
 };

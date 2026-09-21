@@ -46,7 +46,7 @@ Redeploy after changing variables or secrets.
 
 ## API contracts (high level)
 
-All JSON responses use `Content-Type: application/json; charset=utf-8` and allow CORS origin `*`. `OPTIONS` is supported for CORS preflight.
+All JSON responses use `Content-Type: application/json; charset=utf-8`. `GET` allows CORS origin `*`. Mutating `POST` routes use **same-origin CORS only** (not `*`). `OPTIONS` is supported for CORS preflight.
 
 ### `GET /api/snapshot`
 
@@ -72,25 +72,31 @@ Write path used by Apps Script (`publishUmmSnapshotForDashboard` → `notifyClou
 - **Id:** `payload.latestSnapshot.snapshotId`, or a generated `SNAP_<timestamp>` fallback.
 - **Storage:** upsert into D1 `snapshots` on `snapshot_id` (`generated_at_hkt`, `market_date_et`, `payload_json`).
 
+**Auth (fail-closed):** Requires `X-UMM-Publish-Secret` or `Authorization: Bearer <secret>` matching Worker secret `UMM_REFRESH_SECRET`. If the Worker secret is **unset/empty**, the write is **refused** (`503 SERVER_MISCONFIGURED`) — never open writes. Mismatch → `401 UNAUTHORIZED`.
+
 | Status | Body |
 | --- | --- |
-| `200` | `{ "ok": true, "status": "STORED", "snapshotId": "…" }` |
-| `500` | `{ "status": "WRITE_ERROR", "message": "…" }` |
+| `200` | `{ "ok": true, "status": "STORED", "snapshotId": "…", "generatedAtHkt": "…" }` |
+| `401` | `UNAUTHORIZED` — missing/wrong secret |
+| `503` | `SERVER_MISCONFIGURED` — Worker secret not set |
+| `500` | `WRITE_ERROR` |
 
-**Current gap (documented, not changed in WP-UMM-1):** `POST /api/snapshot` has **no auth**. Treat the URL as sensitive; do not publish it beyond the Apps Script publisher until auth is added in a later WP.
+CORS on this mutating route is **same-origin only** (not `*`). Apps Script UrlFetchApp needs no CORS.
 
 ### `POST /api/refresh`
 
-Triggered by the dashboard **刷新 UMM** button.
+Triggered by the dashboard **刷新 UMM** button (browser prompts once for the secret; stored in `sessionStorage` only).
 
-1. Requires `UMM_REFRESH_URL` and `UMM_REFRESH_SECRET` in the Worker env.
-2. Forwards `POST` with JSON `{ "secret": "<UMM_REFRESH_SECRET>" }` to the Apps Script Web App.
-3. Returns the upstream JSON body.
+1. **Auth (fail-closed):** same secret header as `POST /api/snapshot`.
+2. Requires `UMM_REFRESH_URL` in the Worker env (secret already validated).
+3. Forwards `POST` with JSON `{ "secret": "<UMM_REFRESH_SECRET>" }` to the Apps Script Web App.
+4. Returns the upstream JSON body.
 
 | Status | Meaning |
 | --- | --- |
 | `200` | Upstream OK; body is Apps Script refresh result (e.g. `status: "SUCCESS"`) |
-| `500` | `SERVER_MISCONFIGURED` — missing `UMM_REFRESH_URL` or `UMM_REFRESH_SECRET` |
+| `401` | `UNAUTHORIZED` — missing/wrong client secret |
+| `503` | `SERVER_MISCONFIGURED` — Worker secret unset, or `UMM_REFRESH_URL` missing |
 | `502` | Upstream non-OK or network failure (`REFRESH_FAILED` or proxied error body) |
 
 ## Frontend wiring
@@ -105,6 +111,8 @@ In `index.html`:
 - Never commit refresh secrets, API keys, tokens, or generated snapshots.
 - Keep secrets out of `index.html` and `worker.js` source.
 - Prefer Cloudflare **Secrets** for `UMM_REFRESH_SECRET`.
+- **Fail-closed:** unset Worker secret refuses `POST /api/snapshot` and `POST /api/refresh` (never open writes).
+- Dashboard refresh prompts for the secret once per tab (`sessionStorage`); do not hardcode it in `index.html`.
 - Rotate immediately if a secret appears in a screenshot, log, commit, or PR.
 
 ## Related
